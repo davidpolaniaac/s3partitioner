@@ -14,7 +14,7 @@ import (
 
 const (
 	bucketName = "<bucket_name>"
-	depth      = 2
+	depth      = 1
 	maxKeys    = 100
 )
 
@@ -35,27 +35,61 @@ func extractDateFromString(s string) (time.Time, error) {
 	return t, nil
 }
 
-func getNewFilePath(event string, date time.Time, filename string) string {
-	return fmt.Sprintf("%s/year=%04d/month=%02d/day=%02d/hour=%02d/%s", event, date.Year(), date.Month(), date.Day(), date.Hour(), filename)
+func getNewFilePath(prefix string, date time.Time, fileName string) string {
+	partition := fmt.Sprintf("year=%04d/month=%02d/day=%02d/hour=%02d/%s", date.Year(), date.Month(), date.Day(), date.Hour(), fileName)
+	if len(prefix) != 0 {
+		return fmt.Sprintf("%s/%s", prefix, partition)
+	}
+	return partition
 }
 
-func logic(path []string, fileKey string, svc *s3.S3, wg *sync.WaitGroup) error {
-	defer wg.Done()
-	event := path[0]
-	fileName := path[1]
+func getPrefix(path []string) string {
+	if len(path) > depth {
+		return strings.Join(path[:depth], "/")
+	}
+	return ""
+}
 
+func splitKey(key string) []string {
+	split := strings.Split(key, "/")
+	var nonEmpty []string
+	for _, elem := range split {
+		if elem != "" {
+			nonEmpty = append(nonEmpty, elem)
+		}
+	}
+	return nonEmpty
+}
+
+func getPartition(key string) (string, error) {
+	path := splitKey(key)
+	prefix := getPrefix(path)
+	fileName := path[len(path)-1]
 	date, err := extractDateFromString(fileName)
 	if err != nil {
-		fmt.Println("ExtractDateFromString", err, fileKey)
+		fmt.Println("ExtractDateFromString", err, key)
+		return "", fmt.Errorf("date not found in string: %s", fileName)
+	}
+	newKey := getNewFilePath(prefix, date, fileName)
+
+	if key != newKey {
+		return newKey, nil
+	} else {
+		return "", fmt.Errorf("file is ok: %s == %s", key, newKey)
+	}
+}
+
+func logic(fileKey string, svc *s3.S3, wg *sync.WaitGroup) error {
+	defer wg.Done()
+
+	newKey, err := getPartition(fileKey)
+	if err != nil {
 		return nil
 	}
-
-	newFilePath := getNewFilePath(event, date, fileName)
-
 	_, err = svc.CopyObject(&s3.CopyObjectInput{
 		Bucket:     aws.String(bucketName),
 		CopySource: aws.String(fmt.Sprintf("%s/%s", bucketName, fileKey)),
-		Key:        aws.String(newFilePath),
+		Key:        aws.String(newKey),
 	})
 	if err != nil {
 		fmt.Println("Copy", err, fileKey)
@@ -74,15 +108,8 @@ func logic(path []string, fileKey string, svc *s3.S3, wg *sync.WaitGroup) error 
 	return nil
 }
 
-func splitKey(key string) []string {
-	split := strings.Split(key, "/")
-	var nonEmpty []string
-	for _, elem := range split {
-		if elem != "" {
-			nonEmpty = append(nonEmpty, elem)
-		}
-	}
-	return nonEmpty
+func isFile(key string) bool {
+	return !strings.HasSuffix(key, "/")
 }
 
 func partition() {
@@ -110,10 +137,9 @@ func partition() {
 		}
 		total += len(result.Contents)
 		for _, obj := range result.Contents {
-			path := splitKey(*obj.Key)
-			if len(path) == depth {
+			if isFile(*obj.Key) {
 				wg.Add(1)
-				go logic(path, *obj.Key, svc, &wg)
+				go logic(*obj.Key, svc, &wg)
 			}
 		}
 		wg.Wait()
